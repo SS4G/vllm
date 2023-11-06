@@ -19,6 +19,7 @@ _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 _PARTITION_SIZE = 512
 
 
+# ! PagedAttn 核心代码在这里
 class PagedAttention(nn.Module):
     # pylint: disable=line-too-long
     """GPT-style multi-head PagedAttention.
@@ -297,7 +298,7 @@ class PagedAttention(nn.Module):
         return output.view(batch_size, seq_len,
                            self.num_heads * self.head_size)
 
-
+# 为什么这部分Attention 需要带上位置编码的信息呢?
 class PagedAttentionWithRoPE(PagedAttention):
     """PagedAttention with rotary positional embedding."""
 

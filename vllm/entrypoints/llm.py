@@ -90,6 +90,7 @@ class LLM:
             swap_space=swap_space,
             **kwargs,
         )
+        # * 这个LLMEngine 是个什么东西
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_counter = Counter()
 
@@ -154,7 +155,7 @@ class LLM:
             else:
                 token_ids = prompt_token_ids[i]
             self._add_request(prompt, sampling_params, token_ids)
-        return self._run_engine(use_tqdm)
+        return self._run_engine(use_tqdm) # * 这里看来是核心代码
 
     def _add_request(
         self,
@@ -163,6 +164,7 @@ class LLM:
         prompt_token_ids: Optional[List[int]],
     ) -> None:
         request_id = str(next(self.request_counter))
+        # * 操作都是在操作engine 输入promoet 给engine
         self.llm_engine.add_request(request_id, prompt, sampling_params,
                                     prompt_token_ids)
 

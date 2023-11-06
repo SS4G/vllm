@@ -156,6 +156,7 @@ class BaiChuanAttention(nn.Module):
                                                 scaling, alibi_slopes)
         else:
             self.scaling = self.head_dim**-0.5
+            # * 看起来所谓的paged attntion 实际上就是把 HF Tansfomers 中的Attntion替换成了PagedAtention 其他的没有变化
             self.attn = PagedAttentionWithRoPE(
                 self.num_heads,
                 self.head_dim,

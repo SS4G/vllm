@@ -139,6 +139,7 @@ class LLMEngine:
             distributed_init_method,
         )
         self.workers.append(worker)
+        # * 看起来每个woker是有对应指令的
         self._run_workers(
             "init_model",
             get_all_outputs=True,
@@ -273,6 +274,7 @@ class LLMEngine:
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
                                   arrival_time)
 
+        # * 将请求转化为 seq_group 放入scheduler中
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
 
@@ -558,7 +560,8 @@ class LLMEngine:
         if scheduler_outputs.is_empty():
             return ignored
 
-        # Execute the model.
+        # * 调用worker计算模型结果
+        # Execute the model. 
         output = self._run_workers(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
@@ -567,6 +570,7 @@ class LLMEngine:
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
         )
 
+        # * 处理模型的输出
         return self._process_model_outputs(output, scheduler_outputs) + ignored
 
     def _log_system_stats(
@@ -632,6 +636,7 @@ class LLMEngine:
                     f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%")
         self.last_logging_time = now
 
+    # * 将token结果解析成文字
     def _decode_sequence(self, seq: Sequence, prms: SamplingParams) -> None:
         """Decodes the new token for a sequence."""
         (new_tokens, new_output_text, prefix_offset,
@@ -697,6 +702,7 @@ class LLMEngine:
             else:
                 executor = getattr(worker, method)
 
+            # * 逐个worker调用executor 然后回收结果到output中
             output = executor(*args, **kwargs)
             all_outputs.append(output)
 

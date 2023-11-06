@@ -62,6 +62,7 @@ def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
 
 
 def get_model(model_config: ModelConfig) -> nn.Module:
+    # * 从这里通过model的对应name 获取到对应model的class
     model_class = _get_model_architecture(model_config.hf_config)
 
     # Get the quantization config.
@@ -104,5 +105,5 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
-            model = model.cuda()
+            model = model.cuda() # * 看起来是把模型直接 推到对应的GPU上训练 这里需要看下torch的多卡推理
     return model.eval()

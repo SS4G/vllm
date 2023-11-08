@@ -56,11 +56,13 @@ class PhysicalTokenBlock:
         block_number: int,
         block_size: int,
     ) -> None:
-        self.device = device
+        # ! 实际上pyh block 只是一个meta类 并没有指向真正的底层存储 
+        # ! 至于在哪里指向需要查看一下
+        self.device = device # 对应的GPU设备编号
         self.block_number = block_number
         self.block_size = block_size
 
-        self.ref_count = 0
+        self.ref_count = 0 # 实际指向该快的数量 只有这个ref count为0的时候 这个块才会被深处
 
     def __repr__(self) -> str:
         return (f'PhysicalTokenBlock(device={self.device}, '

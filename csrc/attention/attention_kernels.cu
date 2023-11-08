@@ -192,6 +192,8 @@ __device__ void paged_attention_kernel(
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+        // ! 将key-cache 和val-cache 与block table 关联起来的地方 
+        // ! 所以只要传入 phyblock 编号即可以在内部映射到对应的显存地址 
         const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride
                                         + kv_head_idx * kv_head_stride
                                         + physical_block_offset * x;

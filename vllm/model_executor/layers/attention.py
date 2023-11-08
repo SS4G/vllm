@@ -161,6 +161,7 @@ class PagedAttention(nn.Module):
         use_v1 = input_metadata.max_context_len <= 8192 and (
             max_num_partitions == 1 or num_seqs * num_heads > 512)
         if use_v1:
+            # * KV Cache 直接进入了 kernelOPS 中参与计算了
             # Run PagedAttention V1.
             attention_ops.paged_attention_v1(
                 output,
@@ -189,6 +190,7 @@ class PagedAttention(nn.Module):
                 device=output.device,
             )
             max_logits = torch.empty_like(exp_sums)
+            # pagedattention v2 是一个用cuda自己实现的kernel
             attention_ops.paged_attention_v2(
                 output,
                 exp_sums,

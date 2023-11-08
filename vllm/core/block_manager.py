@@ -39,6 +39,7 @@ class BlockAllocator:
         block.ref_count = 1
         return block
 
+    # ! 所谓的free只是把这个block块释放回池子里面
     def free(self, block: PhysicalTokenBlock) -> None:
         if block.ref_count == 0:
             raise ValueError(f"Double free! {block} is already freed.")
@@ -49,10 +50,8 @@ class BlockAllocator:
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
 
-
 # Mapping: logical block number -> physical block.
 BlockTable = List[PhysicalTokenBlock]
-
 
 class BlockSpaceManager:
     """Manages the mapping between logical and physical token blocks."""
@@ -83,7 +82,8 @@ class BlockSpaceManager:
                                             num_gpu_blocks)
         self.cpu_allocator = BlockAllocator(Device.CPU, block_size,
                                             num_cpu_blocks)
-        # Mapping: seq_id -> BlockTable.
+        # * block space manager 只关联了 phyblokc list
+        # Mapping: seq_id -> BlockTable. 
         self.block_tables: Dict[int, BlockTable] = {}
 
     def can_allocate(self, seq_group: SequenceGroup) -> bool:
@@ -263,7 +263,7 @@ class BlockSpaceManager:
         self.block_tables.clear()
 
     def get_block_table(self, seq: Sequence) -> List[int]:
-        block_table = self.block_tables[seq.seq_id]
+        block_table = self.block_tables[seq.seq_id] # ! 每个seq 对应一个block table
         return [block.block_number for block in block_table]
 
     def get_num_free_gpu_blocks(self) -> int:

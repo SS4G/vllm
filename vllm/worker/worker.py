@@ -363,14 +363,15 @@ class Worker:
 
         # Prepare input tensors.
         input_tokens, input_positions, input_metadata = self._prepare_inputs(
-            seq_group_metadata_list)
+            seq_group_metadata_list) # 这个group_metadata_list 应该是从Scheduler中来的 
 
-        # ? 这个model函数是怎么执行的??
+        # worker 里面通过model_config 获取模型 然后执行模型对应的foward函数 
+        # paged attention 对应的数据是怎么传入的?
         # Execute the model.
         output = self.model(
             input_ids=input_tokens,
             positions=input_positions,
-            kv_caches=self.gpu_cache,
+            kv_caches=self.gpu_cache, 
             input_metadata=input_metadata,
             cache_events=cache_events,
         )

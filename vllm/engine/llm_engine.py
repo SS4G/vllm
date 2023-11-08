@@ -277,6 +277,7 @@ class LLMEngine:
         # * 将请求转化为 seq_group 放入scheduler中
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
+        # seq group 添加到scheduler中等待调度
 
     def abort_request(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a request(s) with the given ID.
@@ -422,6 +423,7 @@ class LLMEngine:
                     self.scheduler.free_seq(seq)
             return
 
+        # * 特定beam search 相关的操作
         # Beam search case
         # Select the child sequences to keep in the sequence group.
         selected_child_seqs = []
@@ -699,7 +701,7 @@ class LLMEngine:
         for worker in self.workers:
             if self.parallel_config.worker_use_ray:
                 executor = partial(worker.execute_method.remote, method)
-            else:
+            else: # ! 实际上正常的逻辑走的是这里 直接通过method方法获取woker对应的函数
                 executor = getattr(worker, method)
 
             # * 逐个worker调用executor 然后回收结果到output中

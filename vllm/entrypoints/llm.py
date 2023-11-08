@@ -154,7 +154,7 @@ class LLM:
                 token_ids = None
             else:
                 token_ids = prompt_token_ids[i]
-            self._add_request(prompt, sampling_params, token_ids)
+            self._add_request(prompt, sampling_params, token_ids) # * 添加请求到engine中 
         return self._run_engine(use_tqdm) # * 这里看来是核心代码
 
     def _add_request(
@@ -165,6 +165,7 @@ class LLM:
     ) -> None:
         request_id = str(next(self.request_counter))
         # * 操作都是在操作engine 输入promoet 给engine
+        # ^ 一个request 包含多个promote len(promote) 应该就是batchsize
         self.llm_engine.add_request(request_id, prompt, sampling_params,
                                     prompt_token_ids)
 
@@ -176,6 +177,7 @@ class LLM:
         # Run the engine.
         outputs: List[RequestOutput] = []
         while self.llm_engine.has_unfinished_requests():
+            # * 这里的这个step看起来是一次生成一个token
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
                 if output.finished:

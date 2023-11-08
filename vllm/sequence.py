@@ -64,6 +64,7 @@ class SequenceData:
         self,
         prompt_token_ids: List[int],
     ) -> None:
+        # * 这里是记录token对应的 id 包括promote 以及 output
         self.prompt_token_ids = prompt_token_ids
         self.output_token_ids: List[int] = []
         self.cumulative_logprob = 0.0
@@ -96,6 +97,7 @@ class SequenceData:
                 f"cumulative_logprob={self.cumulative_logprob})")
 
 
+# paged attention 信息看起来就在Sequence 中
 class Sequence:
     """Stores the data, status, and block information of a sequence.
 
@@ -134,6 +136,7 @@ class Sequence:
         self.tokens: Optional[List[str]] = None
 
     def _append_logical_block(self) -> None:
+        # * 新增的logic 编号直接在 后面+1
         block = LogicalTokenBlock(
             block_number=len(self.logical_token_blocks),
             block_size=self.block_size,
@@ -148,7 +151,7 @@ class Sequence:
 
             last_block = self.logical_token_blocks[-1]
             if last_block.is_full():
-                self._append_logical_block()
+                self._append_logical_block() # 在block full之后会新增block
                 last_block = self.logical_token_blocks[-1]
 
             num_empty_slots = last_block.get_num_empty_slots()
@@ -156,6 +159,7 @@ class Sequence:
                                                num_empty_slots])
             cursor += num_empty_slots
 
+    # * 生成的token添加到block中
     def append_token_id(
         self,
         token_id: int,

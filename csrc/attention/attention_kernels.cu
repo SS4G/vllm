@@ -68,6 +68,7 @@ inline __device__ float block_sum(float* red_smem, float sum) {
 
 // TODO(woosuk): Merge the last two dimensions of the grid.
 // Grid: (num_heads, num_seqs, max_num_partitions).
+// $ 一个thread_block 处理一个seq 一个head 的transformer
 template<
   typename scalar_t,
   int HEAD_SIZE,
@@ -113,11 +114,12 @@ __device__ void paged_attention_kernel(
   const int end_token_idx = MIN(start_token_idx + num_blocks * BLOCK_SIZE, context_len);
   const int num_tokens = end_token_idx - start_token_idx;
 
-  constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
-  constexpr int NUM_THREAD_GROUPS = NUM_THREADS / THREAD_GROUP_SIZE; // Note: This assumes THREAD_GROUP_SIZE divides NUM_THREADS
-  assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
+  
+  constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1); // $ 一个warp 处理一个block中的所有token 一个thread_group所有线程 处理一个token
+  constexpr int NUM_THREAD_GROUPS = NUM_THREADS / THREAD_GROUP_SIZE; // Note: This assumes THREAD_GROUP_SIZE divides NUM_THREADS // $ 一个block的总thread_group数量
+  assert(NUM_THREADS % THREAD_GROUP_SIZE == 0); 
   constexpr int NUM_TOKENS_PER_THREAD_GROUP = DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE);
-  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE; // $ 一个block的总warp 数量
   const int thread_idx = threadIdx.x;
   const int warp_idx = thread_idx / WARP_SIZE;
   const int lane = thread_idx % WARP_SIZE;
@@ -129,15 +131,22 @@ __device__ void paged_attention_kernel(
 
   // A vector type to store a part of a key or a query.
   // The vector size is configured in such a way that the threads in a thread group
-  // fetch or compute 16 bytes at a time.
+  // fetch or compute 16 bytes at a time. // $ vec-size 被配置成 一个thread 一次只计算16个Byte
   // For example, if the size of a thread group is 4 and the data type is half,
   // then the vector size is 16 / (4 * sizeof(half)) == 2.
-  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);
+  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1); // $ 一个thread_group 一次处理16B 一个thread 处理一个Vec 4B
   using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
   using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
 
   constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
-  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
+  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE; // $ 如果只有一个thread_group 一个thread 要处理多少个vec
+
+  // * 总结 
+  // * 1. 一个token的总数据量是HEAD_SIZE(emb_size) * sizeof(scalar_t) 
+  // * 2. 一个warp 的线程全用来处理一个Block 一个token的全部计算量只能分配 一个thread_group去处理
+  // * 3. 因为硬件限制, thread_group 一次性处理的数据量只有16B 
+  // * 4. 每个线程一次处理一个VEC 一个VEC的大小是XXX 所以每个线程总共要处理 NUM_VECS_PER_THREAD 个VEC
+  // & 总体拆分 block(warp) -> token(thread_group) -> vec(thread) 
 
   const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
   const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
@@ -148,9 +157,22 @@ __device__ void paged_attention_kernel(
   // has 0, 4, 8, ... th vectors of the query, and the second thread has 1, 5, 9, ...
   // th vectors of the query, and so on.
   // NOTE(woosuk): Because q is split from a qkv tensor, it may not be contiguous.
+  // $ 一个thread_group 下面的每个thread 可能要分多个周期处理一个query中的不同vec 
+  // $ 所以 qvecs的形状是 THREAD_GROUP_SIZE * NUM_VECS_PER_THREAD
   const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
   __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
 #pragma unroll
+  // $ 在cuda block有多个warp的情况下thread_group
+  // $ query 只有一个token 沿 HEAD_SIZE 按照VEC_SIZE 进行切分
+  // $ 对于固定的thread_idx thread_group_idx 和 thread_group_offset 是固定的 
+  // $ 所以填充的步长是 NUM_THREAD_GROUPS * THREAD_GROUP_SIZE 这些数据都是这一个thread 来完成的
+  // $ 纵向的一列是一个thread_group中的不同thread完成填充的
+  // $ 横向的每一步是下一个thread_group 当横向thread_group 用完后 会从第一个thread_group 开始
+  // * 总结 切分的结果 下面这样
+  // *[0, 4,  8, 12, 16, 20, 24, 28]
+  // *[1, 5,  9, 13, 17, 21, 25, 29]
+  // *[2, 6, 10, 14, 18, 22, 26, 30]
+  // *[3, 7, 11, 15, 19, 23, 27, 31]
   for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD; i += NUM_THREAD_GROUPS) {
     const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
     q_vecs[thread_group_offset][i] = *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
@@ -160,24 +182,27 @@ __device__ void paged_attention_kernel(
   // Memory planning.
   extern __shared__ char shared_mem[];
   // NOTE(woosuk): We use FP32 for the softmax logits for better accuracy.
+  // $ 这是softmax的输出
   float* logits = reinterpret_cast<float*>(shared_mem);
   // Workspace for reduction.
   __shared__ float red_smem[2 * NUM_WARPS];
 
   // x == THREAD_GROUP_SIZE * VEC_SIZE
   // Each thread group fetches x elements from the key at a time.
+  // $ x就是每个thread_group 一次读取的element 总共16Byte
   constexpr int x = 16 / sizeof(scalar_t);
   float qk_max = -FLT_MAX;
 
   // Iterate over the key blocks.
-  // Each warp fetches a block of keys for each iteration.
-  // Each thread group in a warp fetches a key from the block, and computes
+  // Each warp fetches a block of keys for each iteration. // $ 一个warp 一次处理一个block
+  // Each thread group in a warp fetches a key from the block, and computes // $ 一个thread_group 一次处理一个token
   // dot product with the query.
-  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
-  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) {
+  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq; // $ block_table = block_tables[seq_idx]
+  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) { // $ 总共NUM_WARPS 个BLOCK 被同时处理
     // NOTE(woosuk): The block number is stored in int32. However, we cast it to int64
     // because int32 can lead to overflow when this variable is multiplied by large numbers
     // (e.g., kv_block_stride).
+    // $ 从逻辑块获取 物理块编号 也就是map映射
     const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
 
     // Load a key to registers.
@@ -185,24 +210,26 @@ __device__ void paged_attention_kernel(
     // For example, if the the thread group size is 4, then the first thread in the group
     // has 0, 4, 8, ... th vectors of the key, and the second thread has 1, 5, 9, ... th
     // vectors of the key, and so on.
-    for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
-      const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
+    for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) { // ! NUM_TOKENS_PER_THREAD_GROUP 1
+      const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE; // $ 等价于 thread_group_idx % BLOCK_SIZE
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-      K_vec k_vecs[NUM_VECS_PER_THREAD];
+      K_vec k_vecs[NUM_VECS_PER_THREAD]; // $ 这是个局部变量 对应thread_group 内offset的所有vec
 
 #pragma unroll
-      for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride
-                                        + kv_head_idx * kv_head_stride
-                                        + physical_block_offset * x;
+      for (int j = 0; j < NUM_VECS_PER_THREAD; j++) { // $ 对thread 内的token 进行切分
+        // $ k_ptr 是block 内这个token的起始地址
+        const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride // $ 定位到物理块
+                                        + kv_head_idx * kv_head_stride // $ 定位到具体的head
+                                        + physical_block_offset * x; // $ 定位到具体块内偏移 x是每个thread 处理的element偏移量
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
-        k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2); // $ 计算具体的向量偏移
       }
 
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
+      // ! 一个thread_group 内的线程都属于同一个warp 所以可以使用束内洗牌指令
       float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset], k_vecs);
       // Add the ALiBi bias if slopes are given.
       qk += (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;

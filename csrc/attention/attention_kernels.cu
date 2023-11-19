@@ -23,10 +23,10 @@
 
 #include <algorithm>
 
-#define WARP_SIZE 32
+#define WARP_SIZE 32 // 一个warp中有多少个线程
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b)) // 向上取整
 
 namespace vllm {
 
@@ -34,18 +34,18 @@ namespace vllm {
 template<int NUM_WARPS>
 inline __device__ float block_sum(float* red_smem, float sum) {
   // Decompose the thread index into warp / lane.
-  int warp = threadIdx.x / WARP_SIZE;
-  int lane = threadIdx.x % WARP_SIZE;
+  int warp = threadIdx.x / WARP_SIZE; // * warp 编号
+  int lane = threadIdx.x % WARP_SIZE; // * warp 内序号
 
   // Compute the sum per warp.
-#pragma unroll
+#pragma unroll // ? warp 内做reduce 这是不是也可以利用硬件来加速并行
   for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
     sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
   }
 
   // Warp leaders store the data to shared memory.
   if (lane == 0) {
-    red_smem[warp] = sum;
+    red_smem[warp] = sum; // ? 为什么这里的索引可以用warp
   }
 
   // Make sure the data is in shared memory.
@@ -67,7 +67,7 @@ inline __device__ float block_sum(float* red_smem, float sum) {
 }
 
 // TODO(woosuk): Merge the last two dimensions of the grid.
-// Grid: (num_heads, num_seqs, max_num_partitions).
+// Grid: (num_heads, num_seqs, max_num_partitions). // $ 只计算一个seq 一个 head中的 情况
 template<
   typename scalar_t,
   int HEAD_SIZE,
@@ -78,8 +78,8 @@ __device__ void paged_attention_kernel(
   float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
   float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
   scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
-  const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
-  const scalar_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
+  const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size] // ! 因为只有1个query token 所以没有seq_length 这个维度
+  const scalar_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x] // ? key cache 为什么被按照 head_size 切开了?
   const scalar_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size]
   const int* __restrict__ head_mapping,   // [num_heads]
   const float scale,
@@ -90,20 +90,21 @@ __device__ void paged_attention_kernel(
   const int q_stride,
   const int kv_block_stride,
   const int kv_head_stride) {
+  // * blockIdx.x is headSize_
   const int seq_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
-  const int max_num_partitions = gridDim.z;
+  const int max_num_partitions = gridDim.z; // * 这个可能是1
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
-  const int context_len = context_lens[seq_idx];
+  const int context_len = context_lens[seq_idx]; // * context_len 是序列的长度
   if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= context_len) {
     // No work to do. Terminate the thread block.
     return;
   }
 
-  const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
+  const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE); // * 序列长度对block_size 进行向上取整
   const int num_blocks_per_partition = USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
-  // [start_block_idx, end_block_idx) is the range of blocks to process.
+  // [start_block_idx, end_block_idx) is the range of blocks to process. // * block 索引
   const int start_block_idx = USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
   const int end_block_idx = MIN(start_block_idx + num_blocks_per_partition, num_context_blocks);
   const int num_blocks = end_block_idx - start_block_idx;
@@ -113,68 +114,94 @@ __device__ void paged_attention_kernel(
   const int end_token_idx = MIN(start_token_idx + num_blocks * BLOCK_SIZE, context_len);
   const int num_tokens = end_token_idx - start_token_idx;
 
-  constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
+  // ? 这里为什么要区分 THREAD_GROUP_SIZE 
+  // ? 每个block 一个warp 中有几个线程可以处理 block中的每个token? 一个token 可能被切分为多个子向量 
+  // ? 一个token向量很长 所以需要多个线程处理? 我们先假设BLOCK_SIZE < 32 默认参数是16 那就是2个线程处理一个TOKEN
+  // ? 保证一个block的数据在一个warp中可以被处理?
+  // * 一个warp 可以处理多少个 block 也就是说多少个thread组成的thread group 处理一个token
+  // * 也就是说一个线程只处理一个token embeding的一部分
+  constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1); // *一个group中包含了多少个线程
   constexpr int NUM_THREAD_GROUPS = NUM_THREADS / THREAD_GROUP_SIZE; // Note: This assumes THREAD_GROUP_SIZE divides NUM_THREADS
   assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
-  constexpr int NUM_TOKENS_PER_THREAD_GROUP = DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE);
+  constexpr int NUM_TOKENS_PER_THREAD_GROUP = DIVIDE_ROUND_UP(BLOCK_SIZE, WARP_SIZE); // ? 这个值基本就是1 如果BLOCK_SIZE < WARP_SIZE
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  // * 线程的索引
   const int thread_idx = threadIdx.x;
   const int warp_idx = thread_idx / WARP_SIZE;
   const int lane = thread_idx % WARP_SIZE;
 
-  const int head_idx = blockIdx.x;
-  const int num_heads = gridDim.x;
+  const int head_idx = blockIdx.x; // * block idx 第一维 是head
+  const int num_heads = gridDim.x; // 
   const int kv_head_idx = head_mapping[head_idx];
   const float alibi_slope = alibi_slopes == nullptr ? 0.f : alibi_slopes[head_idx];
 
-  // A vector type to store a part of a key or a query.
+  // A vector type to store a part of a key or a query. // ? 为设么用这个是可以用什么优化吗？
   // The vector size is configured in such a way that the threads in a thread group
-  // fetch or compute 16 bytes at a time.
+  // fetch or compute 16 bytes at a time. // * 一个thread group一次处理16bytes 这个可能和bank是有关的 128bit
   // For example, if the size of a thread group is 4 and the data type is half,
-  // then the vector size is 16 / (4 * sizeof(half)) == 2.
-  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);
+  // then the vector size is 16 / (4 * sizeof(half)) == 2. // * tensorcore 处理vector size
+  // * half 字是2Byte block_size 是8, 所以是4个thread_group, vec总长度就是16字节
+  // * VEC_SIZE * sizeof(scalar_t) * THREAD_GROUP_SIZE = 16Byte  VEC_Byte * THREAD_GROUP_SIZE = 16Byte 保证一个thread group 一次处理16Byted数据
+  // * 也就是说每个thread 处理一个vec 一个thread group中的vec总共就是 16Byte 是这个关系
+  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(scalar_t)), 1);// * VEC_SIZE 是每个VEC对应多少 scalar_t
   using K_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
   using Q_vec = typename Vec<scalar_t, VEC_SIZE>::Type;
+  // * HEAD_SIZE 是总的embedding_size NUM_ELEMS_PER_THREAD 代表一个thread处理几个scalar_t
+  constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE; // * 一个token 需要THREAD_GROUP_SIZE 哥thread 一个vec
+  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE; // 
+  // ^  VEC_SIZE * NUM_VECS_PER_THREAD * THREAD_GROUP_SIZE = HEAD_SIZE
 
-  constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
-  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
-
+  // * 对应thread 在对应thread group尺度上的位置偏移
   const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
   const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
 
   // Load the query to registers.
   // Each thread in a thread group has a different part of the query.
-  // For example, if the the thread group size is 4, then the first thread in the group
+  // For example, if the the thread group size is 4, then the first thread in the group // * query拆分成vector 然后被不同的thread-group执行
   // has 0, 4, 8, ... th vectors of the query, and the second thread has 1, 5, 9, ...
   // th vectors of the query, and so on.
   // NOTE(woosuk): Because q is split from a qkv tensor, it may not be contiguous.
-  const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE;
-  __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
+  const scalar_t* q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE; // $ q_ptr = q[seq_idx][head_idx]
+  // * 每一行是 thread_group 中的一个thread 
+  // * 每一列是 每个thread 下对应的thread
+  __shared__ Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];// * 每行是对应的thread 处理的vecs
 #pragma unroll
-  for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD; i += NUM_THREAD_GROUPS) {
-    const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
+  // $ cuda block 块中固定128个thread 4个warp 每个warp 又分为多个 thread_group 
+  // $ 每个thread group 中的一个thread 一个周期处理一个vec 
+  // $ q_vecs 每行是一个束内线程的offset 每列是每个线程需要处理的vec 这些vec被分配到不同的thread_groups 中
+  // $ 所以步长是总的thread groups  
+  // $ 总共 NUM_VECS_PER_THREAD * THREAD_GROUP_SIZE 个向量
+  // $ THREAD_GROUP_SIZE = 4 NUM_VECS_PER_THREAD = 8 NUM_THREAD_GROUPS = 32
+  // $ 映射后的vec_index 分布
+  // $ [0, 4, 8, 12, 16, 20, 24, 28]
+  // $ [1, 5, 9, 13, 17, 21, 25, 29]
+  // $ [2, 6, 10, 14, 18, 22, 26, 30]
+  // $ [3, 7, 11, 15, 19, 23, 27, 31]
+  for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD; i += NUM_THREAD_GROUPS) {// 就如comment 所描述的那样 按照NUM_THREAD_GROUPS 跳着来的
+    const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE; // ^ 一次delta实际上是 NUM_THREAD_GROUPS * THREAD_GROUP_SIZE
+    // ! 一个q向量被切分成了多个小段 载入到寄存器中 变成了一个vec矩阵 32行 
     q_vecs[thread_group_offset][i] = *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
   }
   __syncthreads(); // TODO(naed90): possible speedup if this is replaced with a memory wall right before we use q_vecs
 
   // Memory planning.
-  extern __shared__ char shared_mem[];
+  extern __shared__ char shared_mem[]; // ? 外部传入 share_memory 大小
   // NOTE(woosuk): We use FP32 for the softmax logits for better accuracy.
   float* logits = reinterpret_cast<float*>(shared_mem);
   // Workspace for reduction.
-  __shared__ float red_smem[2 * NUM_WARPS];
+  __shared__ float red_smem[2 * NUM_WARPS];// 为什么这里是2
 
   // x == THREAD_GROUP_SIZE * VEC_SIZE
   // Each thread group fetches x elements from the key at a time.
-  constexpr int x = 16 / sizeof(scalar_t);
+  constexpr int x = 16 / sizeof(scalar_t); // ? 总共就是16个字节 根据传入的标量不同 最终取出来的element 个数也不同
   float qk_max = -FLT_MAX;
 
   // Iterate over the key blocks.
-  // Each warp fetches a block of keys for each iteration.
+  // Each warp fetches a block of keys for each iteration.// ^ 这里
   // Each thread group in a warp fetches a key from the block, and computes
   // dot product with the query.
-  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
-  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) {
+  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq; // ^ 找到对应seq的block table的起始位置
+  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx; block_idx += NUM_WARPS) {// ……
     // NOTE(woosuk): The block number is stored in int32. However, we cast it to int64
     // because int32 can lead to overflow when this variable is multiplied by large numbers
     // (e.g., kv_block_stride).
@@ -188,7 +215,7 @@ __device__ void paged_attention_kernel(
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
       const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-      K_vec k_vecs[NUM_VECS_PER_THREAD];
+      K_vec k_vecs[NUM_VECS_PER_THREAD]; // * 注意这里k_vecs 的长度 一个thread
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
@@ -196,15 +223,17 @@ __device__ void paged_attention_kernel(
         // ! 所以只要传入 phyblock 编号即可以在内部映射到对应的显存地址 
         const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride
                                         + kv_head_idx * kv_head_stride
-                                        + physical_block_offset * x;
-        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+                                        + physical_block_offset * x; // ^ 通过stride逐层递进的寻址
+        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE; // $ 逐列
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
         k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
       }
 
+      // ^ 重点 “reduction across the threads in the same thread group.” 一个thread group是不是就是在里面
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
+      // ? same group 每个向量组的长度都为NUM_VECS_PER_THREAD
       float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset], k_vecs);
       // Add the ALiBi bias if slopes are given.
       qk += (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;
@@ -213,7 +242,7 @@ __device__ void paged_attention_kernel(
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
         const bool mask = token_idx >= context_len;
-        logits[token_idx - start_token_idx] = mask ? 0.f : qk;
+        9[token_idx - start_token_idx] = mask ? 0.f : qk;
         // Update the max value.
         qk_max = mask ? qk_max : fmaxf(qk_max, qk);
       }
@@ -244,15 +273,16 @@ __device__ void paged_attention_kernel(
 
   // Get the sum of the exp values.
   float exp_sum = 0.f;
-  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
+  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {// 把这个thread对应的token都求出来 
     float val = __expf(logits[i] - qk_max);
-    logits[i] = val;
+    logits[i] = val;// ^ logits[i] 应该就是每个 row的logt
     exp_sum += val;
   }
   exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
 
   // Compute softmax.
   const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
+  // ^ logits 就是softmax的输出值
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
     logits[i] *= inv_sum;
   }
@@ -330,6 +360,7 @@ __device__ void paged_attention_kernel(
     for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
       acc += __shfl_xor_sync(uint32_t(-1), acc, mask);
     }
+    // ^ acc 这里是softmax logits 和value的加权求和 也就是dot
     accs[i] = acc;
   }
 
@@ -411,12 +442,13 @@ __global__ void paged_attention_v1_kernel(
 }
 
 // Grid: (num_heads, num_seqs, max_num_partitions).
+// ! V2 比V1就多了个partition
 template<
   typename scalar_t,
   int HEAD_SIZE,
   int BLOCK_SIZE,
   int NUM_THREADS,
-  int PARTITION_SIZE>
+  int PARTITION_SIZE> // 这个partition 是个什么东西
 __global__ void paged_attention_v2_kernel(
   float* __restrict__ exp_sums,           // [num_seqs, num_heads, max_num_partitions]
   float* __restrict__ max_logits,         // [num_seqs, num_heads, max_num_partitions]
@@ -503,9 +535,10 @@ __global__ void paged_attention_v2_reduce_kernel(
   // Reduce across warps.
   max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
 #pragma unroll
-  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {// * mask = 16 8 4 2 1? 这看起来是在warp内求最大值用的
     max_logit = fmaxf(max_logit, __shfl_xor_sync(uint32_t(-1), max_logit, mask));
   }
+  // * 这个最大值是用来干什么的?
   // Broadcast the max value to all threads.
   max_logit = __shfl_sync(uint32_t(-1), max_logit, 0);
 
@@ -580,7 +613,7 @@ void paged_attention_v1_launcher(
   int num_heads = query.size(1);
   int head_size = query.size(2);
   int max_num_blocks_per_seq = block_tables.size(1);
-  int q_stride = query.stride(0);
+  int q_stride = query.stride(0); // stride 实际上就是把tensor拍平 沿着特定的dim 跳跃到下一个element的长度
   int kv_block_stride = key_cache.stride(0);
   int kv_head_stride = key_cache.stride(1);
 

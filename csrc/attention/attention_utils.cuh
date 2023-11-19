@@ -27,17 +27,18 @@ namespace vllm {
 // Q*K^T operation.
 template<int THREAD_GROUP_SIZE, typename Vec, int N>
 inline __device__ float qk_dot_(const Vec (&q)[N], const Vec (&k)[N]) {
-  using A_vec = typename FloatVec<Vec>::Type;
+  using A_vec = typename FloatVec<Vec>::Type; // ^ 束内线程并行处理
   // Compute the parallel products for Q*K^T (treat vector lanes separately).
-  A_vec qk_vec = mul<A_vec, Vec, Vec>(q[0], k[0]);
+  A_vec qk_vec = mul<A_vec, Vec, Vec>(q[0], k[0]); // 只有相乘 没有相加 q_vec[0] * k_vec[0]
 #pragma unroll
-  for (int ii = 1; ii < N; ++ii) {
-    qk_vec = fma(q[ii], k[ii], qk_vec);
+  for (int ii = 1; ii < N; ++ii) { // ^ 这里的N是 NUM_VECS_PER_THREAD
+    qk_vec = fma(q[ii], k[ii], qk_vec); // fma round(q * k + qk_vec)
   }
 
-  // Finalize the reduction across lanes.
-  float qk = sum(qk_vec);
-#pragma unroll
+  // Finalize the reduction across lanes. // ^ 束内线程求和
+  float qk = sum(qk_vec); // ^ 为什么vec 需要sum一次?
+#pragma unroll 
+  // ^ 这里应该是warp 内聚合结果
   for (int mask = THREAD_GROUP_SIZE / 2; mask >= 1; mask /= 2) {
     qk += __shfl_xor_sync(uint32_t(-1), qk, mask);
   }

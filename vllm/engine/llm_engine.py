@@ -389,6 +389,7 @@ class LLMEngine:
             for child_sample in child_samples[:-1]:
                 new_child_seq_id = next(self.seq_counter)
                 child = parent.fork(new_child_seq_id)
+                # * 这里加入新产生的token
                 child.append_token_id(child_sample.output_token,
                                       child_sample.logprobs)
                 child_seqs.append((child, parent))

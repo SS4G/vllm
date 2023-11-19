@@ -266,6 +266,7 @@ class BaiChuanModel(nn.Module):
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
+        # * 从这里获取的id和embeding
         hidden_states = self.embed_tokens(input_ids)
         for i in range(len(self.layers)):
             if cache_events is None:

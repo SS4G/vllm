@@ -159,7 +159,7 @@ class Sequence:
                                                num_empty_slots])
             cursor += num_empty_slots
 
-    # * 生成的token添加到block中
+    # * 生成的token添加到block中 这里是logic block
     def append_token_id(
         self,
         token_id: int,

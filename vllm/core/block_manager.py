@@ -130,15 +130,16 @@ class BlockSpaceManager:
     def append_slot(self, seq: Sequence) -> Optional[Tuple[int, int]]:
         """Allocate a physical slot for a new token."""
         logical_blocks = seq.logical_token_blocks
-        block_table = self.block_tables[seq.seq_id]
+        block_table = self.block_tables[seq.seq_id] # 物理block table 和 seq_id 是对应的
 
-        if len(block_table) < len(logical_blocks):
+        if len(block_table) < len(logical_blocks): # * 当物理block 小于logic 分配新的物理块
             if (self.block_sliding_window
                     and len(block_table) >= self.block_sliding_window):
                 # re-use a block
                 block_table.append(block_table[len(block_table) %
                                                self.block_sliding_window])
             else:
+                # ! 这里是核心的映射 
                 # The sequence has a new logical block.
                 # Allocate a new physical block.
                 block = self.gpu_allocator.allocate()

@@ -203,7 +203,7 @@ class Scheduler:
         # Reserve new token slots for the running sequence groups.
         running: List[SequenceGroup] = []
         preempted: List[SequenceGroup] = []
-        while self.running:
+        while self.running: # running 状态下 如果物理的block 变多了 就新增一个block
             seq_group = self.running.pop(0)
             while not self.block_manager.can_append_slot(seq_group):
                 if self.running:
@@ -274,12 +274,13 @@ class Scheduler:
 
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
-        for seq_group in scheduler_outputs.scheduled_seq_groups:
+        for seq_group in scheduler_outputs.scheduled_seq_groups: 
             seq_data: Dict[int, SequenceData] = {}
             block_tables: Dict[int, List[int]] = {}
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
+                # * 这里看起来是在做逻辑到物理的映射
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
 
             seq_group_metadata = SequenceGroupMetadata(

@@ -244,7 +244,8 @@ class Worker:
 
             for seq_id in seq_ids:
                 seq_data = seq_group_metadata.seq_data[seq_id]
-                generation_token = seq_data.get_last_token_id()
+                generation_token = seq_data.get_last_token_id() 
+                # * 因为是一个一个生成的 所以input_tokens 只输入最后一个token_id 然后包装成长度为1的list
                 input_tokens.append([generation_token])
 
                 context_len = seq_data.get_len()
@@ -369,7 +370,7 @@ class Worker:
         # paged attention 对应的数据是怎么传入的?
         # Execute the model.
         output = self.model(
-            input_ids=input_tokens,
+            input_ids=input_tokens, #
             positions=input_positions,
             kv_caches=self.gpu_cache, 
             input_metadata=input_metadata,

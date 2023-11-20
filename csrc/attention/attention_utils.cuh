@@ -27,16 +27,17 @@ namespace vllm {
 // Q*K^T operation.
 template<int THREAD_GROUP_SIZE, typename Vec, int N>
 inline __device__ float qk_dot_(const Vec (&q)[N], const Vec (&k)[N]) {
+  // $ 这里的N 是NUM_VECS_PER_THREAD
   using A_vec = typename FloatVec<Vec>::Type;
   // Compute the parallel products for Q*K^T (treat vector lanes separately).
   A_vec qk_vec = mul<A_vec, Vec, Vec>(q[0], k[0]);
-#pragma unroll
-  for (int ii = 1; ii < N; ++ii) {
-    qk_vec = fma(q[ii], k[ii], qk_vec);
+#pragma unroll // $ 单线程内循环展开 
+  for (int ii = 1; ii < N; ++ii) { // ? key是在输入的时候就被转置了吗 看起来是不需要转置的 矩阵乘法本来就是内积
+    qk_vec = fma(q[ii], k[ii], qk_vec); // $ q k 的逐个vec做乘法 
   }
 
   // Finalize the reduction across lanes.
-  float qk = sum(qk_vec);
+  float qk = sum(qk_vec); // $ 计算每个向量的内积结果
 #pragma unroll
   for (int mask = THREAD_GROUP_SIZE / 2; mask >= 1; mask /= 2) {
     qk += __shfl_xor_sync(uint32_t(-1), qk, mask);

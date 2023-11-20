@@ -81,7 +81,7 @@ __device__ void paged_attention_kernel(
   scalar_t* __restrict__ out,             // [num_seqs, num_heads, max_num_partitions, head_size]
   const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
   const scalar_t* __restrict__ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
-  const scalar_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size]
+  const scalar_t* __restrict__ v_cache,   // [num_blocks, num_kv_heads, head_size, block_size] // $ block_size * num_blocks = seq_len
   const int* __restrict__ head_mapping,   // [num_heads]
   const float scale,
   const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
@@ -173,6 +173,8 @@ __device__ void paged_attention_kernel(
   // *[1, 5,  9, 13, 17, 21, 25, 29]
   // *[2, 6, 10, 14, 18, 22, 26, 30]
   // *[3, 7, 11, 15, 19, 23, 27, 31]
+  // !虽然用一个线程 也能完成类似的填充 但是对于qvec 线程是过剩的 所以就用上了 NUM_THREAD_GROUPS
+  // !但是对于 kv 线程是不够的 所以就直接按照行来填充
   for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD; i += NUM_THREAD_GROUPS) {
     const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
     q_vecs[thread_group_offset][i] = *reinterpret_cast<const Q_vec*>(q_ptr + vec_idx * VEC_SIZE);
@@ -213,23 +215,27 @@ __device__ void paged_attention_kernel(
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) { // ! NUM_TOKENS_PER_THREAD_GROUP 1
       const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE; // $ 等价于 thread_group_idx % BLOCK_SIZE
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
-      K_vec k_vecs[NUM_VECS_PER_THREAD]; // $ 这是个局部变量 对应thread_group 内offset的所有vec
+      K_vec k_vecs[NUM_VECS_PER_THREAD]; // $ 这是个局部变量 对应thread_groups中的一个线程需要处理的所有vec
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) { // $ 对thread 内的token 进行切分
         // $ k_ptr 是block 内这个token的起始地址
-        const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride // $ 定位到物理块
-                                        + kv_head_idx * kv_head_stride // $ 定位到具体的head
-                                        + physical_block_offset * x; // $ 定位到具体块内偏移 x是每个thread 处理的element偏移量
-        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
-        const int offset1 = (vec_idx * VEC_SIZE) / x;
-        const int offset2 = (vec_idx * VEC_SIZE) % x;
-        k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2); // $ 计算具体的向量偏移
+        // $ k_cache,   // [num_blocks, num_kv_heads, head_size/x, block_size, x]
+        const scalar_t* k_ptr = k_cache + physical_block_number * kv_block_stride // $ 定位到物理块 num_blocks
+                                        + kv_head_idx * kv_head_stride // $ 定位到具体的head num_kv_heads
+                                        + physical_block_offset * x; // $ 定位到具体块内偏移 block_size x是每个thread group 处理的element偏移量
+        // $ 填充一行
+        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE; // $ vec_idx ∈ [0, NUM_VECS_PER_THREAD * THREAD_GROUP_SIZE]
+        const int offset1 = (vec_idx * VEC_SIZE) / x; // $ head_size/x 维度上移动
+        const int offset2 = (vec_idx * VEC_SIZE) % x; // $ 在切分后的head中
+        // $ 计算具体的向量偏移 在维度 2, 4上移动
+        k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2); 
       }
 
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
       // ! 一个thread_group 内的线程都属于同一个warp 所以可以使用束内洗牌指令
+      // 计算同一个thread_offset 行向量的dot
       float qk = scale * Qk_dot<scalar_t, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset], k_vecs);
       // Add the ALiBi bias if slopes are given.
       qk += (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;

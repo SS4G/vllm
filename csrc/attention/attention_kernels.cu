@@ -244,7 +244,7 @@ __device__ void paged_attention_kernel(
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
         const bool mask = token_idx >= context_len;
-        logits[token_idx - start_token_idx] = mask ? 0.f : qk;
+        logits[token_idx - start_token_idx] = mask ? 0.f : qk; // $ 将第k个token的qk 写入logit 所以上面的dot 应该是内部做了聚合
         // Update the max value.
         qk_max = mask ? qk_max : fmaxf(qk_max, qk);
       }

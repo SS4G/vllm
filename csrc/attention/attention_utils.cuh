@@ -33,11 +33,12 @@ inline __device__ float qk_dot_(const Vec (&q)[N], const Vec (&k)[N]) {
   A_vec qk_vec = mul<A_vec, Vec, Vec>(q[0], k[0]);
 #pragma unroll // $ 单线程内循环展开 
   for (int ii = 1; ii < N; ++ii) { // ? key是在输入的时候就被转置了吗 看起来是不需要转置的 矩阵乘法本来就是内积
-    qk_vec = fma(q[ii], k[ii], qk_vec); // $ q k 的逐个vec做乘法 
+    qk_vec = fma(q[ii], k[ii], qk_vec); // $ q k 的逐个vec做乘法  
+    // $ Fused Multiply-Add 里面应该都是汇编 计算后的结果应该都是vec_size
   }
 
   // Finalize the reduction across lanes.
-  float qk = sum(qk_vec); // $ 计算每个向量的内积结果
+  float qk = sum(qk_vec); // $ 计算每个向量的内积结果 VEC_SIZE->1
 #pragma unroll
   for (int mask = THREAD_GROUP_SIZE / 2; mask >= 1; mask /= 2) {
     qk += __shfl_xor_sync(uint32_t(-1), qk, mask);

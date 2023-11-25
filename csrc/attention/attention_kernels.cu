@@ -105,14 +105,15 @@ __device__ void paged_attention_kernel(
   const int num_blocks_per_partition = USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
 
   // [start_block_idx, end_block_idx) is the range of blocks to process.
-  const int start_block_idx = USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
+  const int start_block_idx = USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0; // $ 逻辑块内的block idx 逻辑上是连续的
   const int end_block_idx = MIN(start_block_idx + num_blocks_per_partition, num_context_blocks);
   const int num_blocks = end_block_idx - start_block_idx;
 
+  // token_idx 都是逻辑上的
   // [start_token_idx, end_token_idx) is the range of tokens to process.
   const int start_token_idx = start_block_idx * BLOCK_SIZE;
   const int end_token_idx = MIN(start_token_idx + num_blocks * BLOCK_SIZE, context_len);
-  const int num_tokens = end_token_idx - start_token_idx;
+  const int num_tokens = end_token_idx - start_token_idx; 
 
   
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1); // $ 一个warp 处理一个block中的所有token 一个thread_group所有线程 处理一个token
@@ -240,10 +241,11 @@ __device__ void paged_attention_kernel(
       // Add the ALiBi bias if slopes are given.
       qk += (alibi_slope != 0) ? alibi_slope * (token_idx - context_len + 1) : 0;
 
-      if (thread_group_offset == 0) {
+      if (thread_group_offset == 0) { // $ thread_group_offset = 0 装入了一个token
         // Store the partial reductions to shared memory.
         // NOTE(woosuk): It is required to zero out the masked logits.
         const bool mask = token_idx >= context_len;
+        // $ logit 的长度应该是KV cache token长度的。
         logits[token_idx - start_token_idx] = mask ? 0.f : qk; // $ 将第k个token的qk 写入logit 所以上面的dot 应该是内部做了聚合
         // Update the max value.
         qk_max = mask ? qk_max : fmaxf(qk_max, qk);
@@ -276,14 +278,14 @@ __device__ void paged_attention_kernel(
   // Get the sum of the exp values.
   float exp_sum = 0.f;
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-    float val = __expf(logits[i] - qk_max);
+    float val = __expf(logits[i] - qk_max);// * 使用和flash attention 类似的减去qk_max 的方法来计算exp
     logits[i] = val;
     exp_sum += val;
   }
   exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
 
   // Compute softmax.
-  const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
+  const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f); // * 只计算一次除法 剩下都用乘法 是不是因为乘法更快
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
     logits[i] *= inv_sum;
   }
@@ -302,19 +304,23 @@ __device__ void paged_attention_kernel(
   }
 
   // Each thread will fetch 16 bytes from the value cache at a time.
-  constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE);
+  constexpr int V_VEC_SIZE = MIN(16 / sizeof(scalar_t), BLOCK_SIZE); // * vec 长度是16B
   using V_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
   using L_vec = typename Vec<scalar_t, V_VEC_SIZE>::Type;
   using Float_L_vec = typename FloatVec<L_vec>::Type;
 
-  constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
-  constexpr int NUM_ROWS_PER_ITER = WARP_SIZE / NUM_V_VECS_PER_ROW;
-  constexpr int NUM_ROWS_PER_THREAD = DIVIDE_ROUND_UP(HEAD_SIZE, NUM_ROWS_PER_ITER);
+  // $一下是一个block的计算量 一个warp 处理一个block的数据
+  // ? 为什么是row?
+  constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE; // * 这里的row实际上是v的一列
+  constexpr int NUM_ROWS_PER_ITER = WARP_SIZE / NUM_V_VECS_PER_ROW; // * 一个thread 处理一个vec 那么一次迭代一个warp 可以处理多少个row
+  constexpr int NUM_ROWS_PER_THREAD = DIVIDE_ROUND_UP(HEAD_SIZE, NUM_ROWS_PER_ITER); // * head_size 是总的row 数量 如果一次一个warp一起处理x个row 那么处理完所有的row需要几次 那么一个thread 要处理几个row
+  // ? 只是这个变量名起的有点让人迷惑
+  // $ NUM_ROWS_PER_THREAD 真正的含义是如果只有一个warp 一个线程处理一个v_vec 需要多少次迭代才能处理完整个value矩阵
 
   // NOTE(woosuk): We use FP32 for the accumulator for better accuracy.
   float accs[NUM_ROWS_PER_THREAD];
 #pragma unroll
-  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {// 总共需要 NUM_ROWS_PER_THREAD 次迭代
     accs[i] = 0.f;
   }
 
@@ -325,7 +331,8 @@ __device__ void paged_attention_kernel(
     // because int32 can lead to overflow when this variable is multiplied by large numbers
     // (e.g., kv_block_stride).
     const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
-    const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
+    // $ 根据线程号计算出在物理块内的偏移量 对应哪个token
+    const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE; // $ row 内vec 偏移量 这里的element数量(vec的elemnt) 对应的是一个token
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
     L_vec logits_vec;
     from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(logits + token_idx - start_token_idx));
@@ -334,9 +341,10 @@ __device__ void paged_attention_kernel(
                                     + kv_head_idx * kv_head_stride;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
-      if (row_idx < HEAD_SIZE) {
-        const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
+      // $ lane / NUM_V_VECS_PER_ROW 是啥? 
+      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER; // $ 根据warp iter号和lane 号确定具体的row(列)号
+      if (row_idx < HEAD_SIZE) {// $ 这个row idx就是v矩阵横向的列索引
+        const int offset = row_idx * BLOCK_SIZE + physical_block_offset; // $ 确定物理偏移后 取出vec 和logit 做相乘
         V_vec v_vec = *reinterpret_cast<const V_vec*>(v_ptr + offset);
         if (block_idx == num_context_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the context,
@@ -348,17 +356,18 @@ __device__ void paged_attention_kernel(
             v_vec_ptr[j] = token_idx + j < context_len ? v_vec_ptr[j] : zero_value;
           }
         }
-        accs[i] += dot(logits_vec, v_vec);
+        accs[i] += dot(logits_vec, v_vec); // $同一个logit 对应于多个列 因为每个列乘上的权重都一样
+        // $ 这里用 += 是要把多个block对应位置的dot值的合并起来 他们都属于同一列 而不同的i 属于同一个线程服务的不同列 所以不同的acc[i]不能求和
       }
     }
   }
 
   // Perform reduction within each warp.
 #pragma unroll
-  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
-    float acc = accs[i];
+  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) { // $ 对一个线程服务的不同的row 进行求和 
+    float acc = accs[i]; 
 #pragma unroll
-    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
+    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) { // $ 每个row 内部求和 因为一个ro下面的不同vec 被分给了不同的thread
       acc += __shfl_xor_sync(uint32_t(-1), acc, mask);
     }
     accs[i] = acc;
@@ -371,7 +380,7 @@ __device__ void paged_attention_kernel(
   // Perform reduction across warps.
   float* out_smem = reinterpret_cast<float*>(shared_mem);
 #pragma unroll
-  for (int i = NUM_WARPS; i > 1; i /= 2) {
+  for (int i = NUM_WARPS; i > 1; i /= 2) {// $合并不同warp 之间对应位置的结果 也就是不同的block
     int mid = i / 2;
     // Upper warps write to shared memory.
     if (warp_idx >= mid && warp_idx < i) {
@@ -401,7 +410,7 @@ __device__ void paged_attention_kernel(
   }
 
   // Write the final output.
-  if (warp_idx == 0) {
+  if (warp_idx == 0) { // $ 最后所有结果都在warp_idx = 0的时候写出
     scalar_t* out_ptr = out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE
                             + head_idx * max_num_partitions * HEAD_SIZE
                             + partition_idx * HEAD_SIZE;

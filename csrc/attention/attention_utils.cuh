@@ -39,8 +39,11 @@ inline __device__ float qk_dot_(const Vec (&q)[N], const Vec (&k)[N]) {
 
   // Finalize the reduction across lanes.
   float qk = sum(qk_vec); // $ 计算每个向量的内积结果 VEC_SIZE->1
-#pragma unroll
+#pragma unroll // $ 这是nvidia标准的束内规约代码
   for (int mask = THREAD_GROUP_SIZE / 2; mask >= 1; mask /= 2) {
+    // 0 ^ x = x
+    // 1 ^ x = ~x
+    // mask = 4 2 1
     qk += __shfl_xor_sync(uint32_t(-1), qk, mask);
   }
   return qk;

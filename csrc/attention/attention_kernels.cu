@@ -282,6 +282,7 @@ __device__ void paged_attention_kernel(
     logits[i] = val;
     exp_sum += val;
   }
+  // $ 不同的warp之间做聚合
   exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
 
   // Compute softmax.
